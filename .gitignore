@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.xml
+.vscode
+output
+build
+media
+diff_rasterization_depth_pose
+DROID-SLAM
+simple-knn
+records
+lietorch
+data
+checkpoints
