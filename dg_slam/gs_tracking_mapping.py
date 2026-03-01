@@ -229,15 +229,17 @@ class gs_tracking_mapping():
         return optimizable_tensors
 
     def prune_neural_point(self, min_opacity):
+        # prune_mask = (self.opacity_activation(self.gaussians_opacity_grad) < min_opacity).squeeze()
+        # scale_mask1 = torch.max(self.scaling_activation(self.gaussians_scaling_grad), dim=-1)[0] > 0.15
+        # scale_mask2 = torch.max(self.scaling_activation(self.gaussians_scaling_grad), dim=-1)[0] > \
+        #               (torch.min(self.scaling_activation(self.gaussians_scaling_grad), dim=-1)[0] * 36)
+        # prune_mask = (prune_mask | scale_mask1 | scale_mask2).detach()
+
+        # 仅根据不透明度（Opacity）进行剪枝，彻底放开对圆盘物理尺寸的限制
         prune_mask = (self.opacity_activation(self.gaussians_opacity_grad) < min_opacity).squeeze()
-        scale_mask1 = torch.max(self.scaling_activation(self.gaussians_scaling_grad), dim=-1)[0] > 0.4
-        scale_mask2 = torch.max(self.scaling_activation(self.gaussians_scaling_grad), dim=-1)[0] > \
-                      (torch.min(self.scaling_activation(self.gaussians_scaling_grad), dim=-1)[0] * 36)
-        prune_mask = (prune_mask | scale_mask1 | scale_mask2).detach()
-
-        self.prune_points(prune_mask)
-
+        self.prune_points(prune_mask.detach())
         torch.cuda.empty_cache()
+
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
@@ -413,7 +415,7 @@ class gs_tracking_mapping():
             # 使用恒定数量，保证均匀分布，细节留给 Module 1 去补
             add_pts_num = self.pixels_adding * 6
         else:
-            add_pts_num = 100      
+            add_pts_num = 1000      
 
         # 随机采样 (Random Sampling)
         batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, i, j = get_samples(
@@ -475,13 +477,7 @@ class gs_tracking_mapping():
         with torch.no_grad():
             # --- 1. 准备数据 ---
             depth_np = cur_gt_depth.cpu().numpy()
-            mask_static = refined_mask if refined_mask is not None else torch.ones_like(cur_gt_depth, dtype=torch.bool)
-            
-            # [自适应飞点检测] 阈值随深度增加：0.02 * depth + 0.01 (4m处允许9cm误差)
-            depth_median = cv2.medianBlur(depth_np, 3)
-            depth_diff = np.abs(depth_np - depth_median)
-            adaptive_threshold = 0.02 * depth_np + 0.01 
-            flying_pixel_mask = torch.from_numpy(depth_diff > adaptive_threshold).to(self.device)
+            mask_static = refined_mask if refined_mask is not None else torch.ones_like(cur_gt_depth, dtype=torch.bool)          
 
             # [计算纹理梯度]
             gray = 0.299 * cur_gt_color[:,:,0] + 0.587 * cur_gt_color[:,:,1] + 0.114 * cur_gt_color[:,:,2]
@@ -492,51 +488,15 @@ class gs_tracking_mapping():
             d_grad_y, d_grad_x = torch.gradient(cur_gt_depth)
             d_grad_mag = torch.sqrt(d_grad_x**2 + d_grad_y**2)
 
-            # ================= [新增：深度图降噪过滤器] =================
-            # TUM 数据集的深度图很脏，必须过滤噪声
-            # 逻辑：计算 3x3 邻域内的深度“平滑度”。如果局部方差过大，说明是噪声/飞点。
-            
-            # 1. 准备数据 (扩展维度以适配 AvgPool)
-            depth_tensor = cur_gt_depth.unsqueeze(0).unsqueeze(0) # [1,1,H,W]
-            
-            # 2. 计算局部均值 (3x3)
-            avg_pool = torch.nn.AvgPool2d(3, stride=1, padding=1)
-            local_mean = avg_pool(depth_tensor)
-            
-            # 3. 计算局部绝对差 (近似方差)
-            # 这一步能把那种孤立的噪点、锯齿状边缘给揪出来
-            local_diff = torch.abs(depth_tensor - local_mean).squeeze()
-            
-        
-            # 近景 (Close): < 2.5m (桌子、地板细节) -> 这里噪声最大，伪影最严重
-            # 远景 (Far): > 2.5m (墙角、门框、走廊) -> 这里信号弱，容易被误杀
             is_close = cur_gt_depth < 2.5
             is_far = ~is_close
 
-            # 动态梯度阈值 (Gradient Threshold)
-            # 近处：必须非常显著的边缘才算 (0.15)，防止把噪点当边缘
-            # 远处：只要有一点点边缘特征就保留 (0.02)，防止轮廓丢失
+            # 动态梯度阈值
             thresh_edge = torch.zeros_like(cur_gt_depth)
-            thresh_edge[is_close] = 0.15
-            thresh_edge[is_far] = 0.03  # 远景放宽标准！
+            thresh_edge[is_close] = 0.05
+            thresh_edge[is_far] = 0.01  
             
             cond_geo_grad = d_grad_mag > thresh_edge
-
-            # 3. 动态平滑过滤器 (Smoothness Filter)
-            # 近处：要求非常平滑 (< 0.03)，杀掉突变噪点
-            # 远处：允许粗糙一点 (< 0.10)，适应传感器的远距离误差
-            thresh_smooth = torch.zeros_like(cur_gt_depth)
-            thresh_smooth[is_close] = 0.03
-            thresh_smooth[is_far] = 0.10 # 远景放宽标准！
-            
-            is_smooth_region = local_diff < thresh_smooth
-            
-            # 4. 组合 Edge 条件
-            # 远处的点，只要满足梯度要求，哪怕稍微不平滑也可以接受（为了保轮廓）
-            # 近处的点，必须同时满足梯度大 + 局部平滑，才能加点
-            
-            # 这里为了稳妥，我们对两者都应用平滑过滤，但阈值不同
-            # ==========================================================
 
             # --- 2. 渲染 (获取 opacity_map) ---
             # 依然是渲染，但我们不需要再手动算 density_map 了
@@ -562,15 +522,14 @@ class gs_tracking_mapping():
             # --- 3. 核心决策逻辑 (优化版) ---
             
             # 基础安全区 (保持不变)
-            base_condition = mask_static & (cur_gt_depth > 0.01) & (~flying_pixel_mask)
+            base_condition = mask_static & (cur_gt_depth > 0.01)
             
             # [策略修正 1]: 雪中送炭 (Hole Filling)
             # 真正的空洞 (Opacity < 0.1) 必须补。
             # 但为了防止和剪枝逻辑死锁，建议稍微放宽到 < 0.3，保证能填上深坑
-            cond_hole = (opacity_map < 0.1)
-            
+            cond_hole = (opacity_map < 0.3)
 
-            cond_geo_edge = cond_geo_grad & is_smooth_region & (opacity_map < 0.6)
+            cond_geo_edge = cond_geo_grad  & (opacity_map < 0.8)
 
             # 情况 B: 纹理细节 (Texture Detail) -> 必须克制！
             # 1. 提高梯度阈值 (0.02 -> 0.08)：忽略相机底噪，只关注真正的纹理线条
@@ -578,13 +537,10 @@ class gs_tracking_mapping():
             #    如果表面已经有 0.6 的不透明度，说明这里已经有高斯球了。
             #    剩下的细节应该靠已有高斯球的分裂 (Split) 来完成，而不是盲目插入新点！
             #    插入新点会导致 z-fighting 和细碎噪点。
-            cond_texture = (grad_mag > 0.15) & (opacity_map < 0.4)
+            cond_texture = (grad_mag > 0.15) & (opacity_map < 0.85)
 
-            
-            
             # 合并逻辑：只在 (空洞) 或 (没修好的边缘) 或 (没修好的纹理) 处加点
             target_mask = base_condition & (cond_hole | cond_geo_edge | cond_texture)
-
 
             # --- 4. 可视化 (更新为显示 Opacity) ---
             if idx % 1 == 0: 
@@ -592,9 +548,6 @@ class gs_tracking_mapping():
                 os.makedirs(debug_dir, exist_ok=True)
                 
                 vis_img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
-                
-                # 红色：飞点 (被剔除的)
-                vis_img[:, :, 2] = (flying_pixel_mask.cpu().numpy() * 255).astype(np.uint8) 
                 # 绿色：最终加点位置
                 vis_img[:, :, 1] = (target_mask.cpu().numpy() * 255).astype(np.uint8)
                 # 蓝色：重建程度 (越亮越实) -> 这次你有蓝色看了！
@@ -708,7 +661,7 @@ class gs_tracking_mapping():
             print(f"DEBUG: Frame 0, Initializing Scene, force iters to {num_joint_iters}")
         elif not color_refine:
             # 动态阈值逻辑
-            if frame_pts_add < 500:
+            if frame_pts_add < 100:
                 # 新增点很少 -> 说明视野主要都在已知区域 -> 快速微调 Pose 即可
                 num_joint_iters = 80 
                 print(f"[Adaptive Iters] Old Region (pts_add={frame_pts_add}), Reduce iters to {num_joint_iters}")
@@ -788,56 +741,59 @@ class gs_tracking_mapping():
             weighted_color_loss = self.w_color_loss * color_loss * (1 - self.lambda_ssim_loss)
             loss += weighted_color_loss
 
-
-            # -------------------- [替换/升级] 几何形态引导 (Morphology Loss) --------------------
-            # 获取当前的高斯属性
-            current_scales = self.scaling_activation(self.gaussians_scaling_grad)    # [N, 3]
-            current_opacities = self.opacity_activation(self.gaussians_opacity_grad) # [N, 1]
-            # 1. 轴长排序：找到每个高斯球的 最短轴(厚度) 和 最长轴(半径)
-            # torch.sort 返回 (values, indices)，我们只需要 values
+            # =================================================================================
+            # 1. 核心 Loss：安全版 2D 扁平圆盘正则 (Safe Anti-Needle Disk Loss)
+            # =================================================================================
+            current_scales = self.scaling_activation(self.gaussians_scaling_grad)    
+            current_opacities = self.opacity_activation(self.gaussians_opacity_grad) 
+            
+            # 排序：提取 厚度(min), 短半径(mid), 长半径(max)
             sorted_scales, _ = torch.sort(current_scales, dim=1)
-            min_scales = sorted_scales[:, 0] # 最短轴 (对于墙面就是厚度)
-            max_scales = sorted_scales[:, 2] # 最长轴 (对于墙面就是延展范围)
+            min_scales = sorted_scales[:, 0] 
+            mid_scales = sorted_scales[:, 1] 
+            max_scales = sorted_scales[:, 2] 
             
-            # 2. 扁平化损失 (Anisotropy Loss) -> 解决"糊"的关键
-            # 逻辑：对于实心的表面点(Opacity高)，我们希望它 极薄(min小) 且 广阔(max大)。
-            # 即希望 ratio = min / max 趋近于 0。
-            # 加上 1e-4 防止除以零异常
-            flatness_ratio = min_scales / (max_scales + 1e-4)
+            # 安全扁平化：允许变扁，保留 0.05 (1:20) 厚度兜底防止 NaN
+            flatness_ratio = torch.relu((min_scales / (max_scales + 1e-4)) - 0.05)
+            # 抗针状约束：强迫两长轴相等，变成“硬币”消灭视角伪影
+            needle_ratio = torch.abs(max_scales - mid_scales) / (max_scales + 1e-4)
             
-            # 只对不透明度 > 0.3 的点计算扁平化损失
-            mask_mature = current_opacities.squeeze() > 0.3
+            # 仅对已经成型的点（Opacity > 0.3）施加形状约束
+            mask_mature_shape = current_opacities.squeeze() > 0.3
             
-            if mask_mature.sum() > 0:
-                # 注意：这里我们依然乘以 opacity，但只针对 mature 的点
-                loss_aniso = (flatness_ratio[mask_mature] * current_opacities[mask_mature].squeeze()).mean()
-                loss += 0.5 * loss_aniso # 权重保持 0.5，力度要大
-            
-            # ---------------- [修改 2: 鬼影 Loss 的“远景豁免”] ----------------
-            # 原理：远处的点(Scale很大)本身就该大，不要因为它大且虚就罚它。
-            # 我们只罚那些“中等大小”且“虚”的点，那些通常是近处的伪影。
-            
-            # 假设 max_scales > 1.0 的通常是极远处的背景板 (根据你的场景尺度调整)
-            # 我们只惩罚 scale < 1.0 的点
-            mask_floater_candidates = max_scales < 1.0
-            
-            if mask_floater_candidates.sum() > 0:
-                # 只有在候选名单里的点才计算 Floater Loss
-                floater_val = (max_scales * (1.0 - current_opacities.squeeze())) ** 2
-                loss_floater = floater_val[mask_floater_candidates].mean()
-                loss += 0.01 * loss_floater
+            if mask_mature_shape.sum() > 0:
+                loss_flat = (flatness_ratio[mask_mature_shape] * current_opacities[mask_mature_shape].squeeze()).mean()
+                loss_needle = (needle_ratio[mask_mature_shape] * current_opacities[mask_mature_shape].squeeze()).mean()
+                loss += 0.5 * loss_flat + 0.5 * loss_needle
 
+            # 反向传播计算梯度
             loss.backward(retain_graph=False)
-            
+
             self.max_radii2D = radii
 
             with torch.no_grad():
-                #if joint_iter == num_joint_iters - 1:
-                     #self.prune_dynamic_ghosting(cur_c2w, cur_gt_depth, cur_gt_color, refined_mask, idx.item(), age_thres=0)
+                # =================================================================================
+                # 2. 老点保护：基于生成帧 ID 的几何梯度冻结 (Age-based Geometry Freezing)
+                # =================================================================================
+                # 计算每个点存活的帧数 (年龄)
+                age = idx.item() - self.gaussians_creation_frame_id.squeeze()
+                
+                # 存活超过 5 帧的点被视为“成熟老点”
+                mask_mature_freeze = age > 5
+                
+                if mask_mature_freeze.sum() > 0:
+                    # 强行把老点的空间和形态梯度缩小到 1%（相当于锁死几何）
+                    # 防止因为位姿微小漂移导致老墙面被反复拉扯变糊
+                    self.gaussians_xyz_grad.grad[mask_mature_freeze] *= 0.01
+                    self.gaussians_scaling_grad.grad[mask_mature_freeze] *= 0.01
+                    self.gaussians_rotation_grad.grad[mask_mature_freeze] *= 0.01
+                    # 注意：保留了颜色(SH)和透明度(Opacity)的梯度，允许适应光照和被剪枝
 
+                # 优化器步进
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 actual_joint_iters += 1
+            
 
             total_gs_point_num_prune = self.gaussians_xyz.shape[0]
             if not self.wandb:
@@ -859,100 +815,6 @@ class gs_tracking_mapping():
                     wandb.log({'idx_map': int(idx.item()),
                                'num_joint_iters': num_joint_iters})         
 
-        # 在循环内调用 (建议每 100 次迭代)
-        # with torch.no_grad():
-        #     # 1. 准备数据
-        #     xyz = self.gaussians_xyz_grad
-        #     opacity = self.opacity_activation(self.gaussians_opacity_grad)
-        #     scaling = self.scaling_activation(self.gaussians_scaling_grad)
-            
-        #     # 计算深度 z_cam
-        #     w2c = torch.inverse(cur_c2w)
-        #     R = w2c[:3, :3]; T = w2c[:3, 3]
-        #     pts_cam = (xyz @ R.T) + T
-        #     z_cam = pts_cam[:, 2]  # [N]
-            
-        #     # 2. 定义区域 (Zone)
-        #     # 远景保护区: z > 3.0m (保护屋顶)
-        #     # 近景严管区: z <= 3.0m (清除桌上伪影)
-        #     is_far = z_cam > 3.0
-        #     is_near = ~is_far
-            
-        #     # 3. 计算深度误差 (用于近景杀毒)
-        #     # 投影到屏幕
-        #     u = (pts_cam[:, 0] / z_cam * self.fx + self.cx).long()
-        #     v = (pts_cam[:, 1] / z_cam * self.fy + self.cy).long()
-        #     H, W = self.H, self.W
-        #     valid_uv = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (z_cam > 0.01)
-            
-        #     depth_error = torch.zeros_like(z_cam) 
-                
-        #     if valid_uv.sum() > 0:
-        #         gt_z = cur_gt_depth[v[valid_uv], u[valid_uv]]
-        #         # [Fix 2] 处理 TUM 深度图的空洞问题
-        #         # 只有当 GT 深度大于 0.1m 时，我们才信任它。
-        #         # 如果 GT 深度无效 (比如近处椅子上黑掉的深度图)，我们绝不依据它去删点。
-        #         valid_gt = gt_z > 0.1
-        #         # 仅在屏幕内计算误差
-        #         err = torch.abs(z_cam[valid_uv] - gt_z)
-        #         # 只有当 GT 有效时，才记录误差；GT 无效时，误差计为 0 (放过它)
-        #         depth_error[valid_uv] = torch.where(valid_gt, err, torch.zeros_like(err))
-        #     # ================= [杀戮名单] =================
-            
-        #     # 规则 A: 远景保护 (Far Zone)
-        #     # 只杀极度离谱的点 (比如跑到 100米开外，或者几乎全透明)
-        #     # 阈值极低 (0.001)，基本约等于不杀
-        #     mask_kill_far = is_far & (opacity.squeeze() < 0.001)
-
-        #     # 规则 B: 近景严管 (Near Zone)
-        #     # 1. 深度不一致 (最大的伪影来源)
-        #     #    如果一个点在近处，且和 GT 深度差了 30cm 以上 -> 必杀
-        #     #    这是解决“伪影漫天飞”的核武器
-        #     mask_kill_depth = is_near & (depth_error > 0.3)
-            
-        #     # 2. 试用期淘汰
-        #     #    如果点很新 (假设你有 point_age)，且不够实 -> 杀
-        #     #    如果没有 point_age，就统一用 opacity < 0.05
-        #     #    注意：这里只针对近景！远景就算 opacity=0.01 也留着！
-        #     mask_kill_weak = is_near & (opacity.squeeze() < 0.05)
-            
-        #     # 规则 C: 巨型鬼影 (全局)
-        #     # 只有当球特别大，且特别虚，且在近处挡路时才杀
-        #     max_scales = scaling.max(dim=1).values
-        #     mask_kill_giant = (max_scales > 0.5) & (opacity.squeeze() < 0.1) & is_near
-
-        #     # ============================================
-            
-        #     kill_mask = mask_kill_far | mask_kill_depth | mask_kill_weak | mask_kill_giant
-            
-        #     if kill_mask.sum() > 0:
-        #         self.prune_points(kill_mask)
-        #         print(f"[Module 2] Pruned {kill_mask.sum()} pts")        
-
-        # with torch.no_grad():
-        #     opacity = self.opacity_activation(self.gaussians_opacity_grad)
-        #     scaling = self.scaling_activation(self.gaussians_scaling_grad)
-        #     creation_ids = self.gaussians_creation_frame_id
-            
-        #     point_age = idx.item() - creation_ids.squeeze()
-            
-        #     is_old = point_age >= 5         
-        #     max_scales = scaling.max(dim=1).values
-        #     is_giant = max_scales > 0.5  # 稍微放宽大球定义，避免误伤
-                        
-        #     thresh_young = 0.06
-        #     mask_kill_young = (~is_old) & (opacity.squeeze() < thresh_young)
-            
-        #     thresh_old = 0.01
-        #     mask_kill_old = is_old & (opacity.squeeze() < thresh_old)
-
-        #     mask_kill_giant = is_giant & (opacity.squeeze() < 0.1) & (~is_old)
-        #     kill_mask = mask_kill_young | mask_kill_old | mask_kill_giant
-            
-        #     # -----------------------------------------------------------
-
-        #     if kill_mask.sum() > 0:
-        #         self.prune_points(kill_mask)
     
         self.gaussians_xyz = torch.cat((self.gaussians_xyz_grad.detach().clone(), gaussians_xyz_unfrustum.detach().clone()), 0)
         self.gaussians_features_dc = torch.cat((self.gaussians_features_dc_grad.detach().clone(), gaussians_features_dc_unfrustum.detach().clone()), 0)
@@ -1032,155 +894,6 @@ class gs_tracking_mapping():
         if self.encode_exposure and idx == (self.n_img - 1):
             self.exposure_feat_all.append(self.exposure_feat.detach().cpu())
         return num_joint_iters
-
-    def prune_dynamic_ghosting(self, cur_c2w, gt_depth, gt_color, seg_mask, current_frame_idx, age_thres=0):
-        """
-        修正版 V6：加入 Opacity Boosting Trick
-        目的：强制让半透明的鬼影变"实"，以便深度检测能捕捉到它们。
-        """
-        with torch.no_grad():
-            # 1. 渲染 (Trick: Opacity Boosting)
-            camera_center = cur_c2w[:3, 3]
-            world_view_transform = torch.inverse(cur_c2w).transpose(0, 1)
-            
-            # [关键 Trick] 放大透明度
-            opacity = self.opacity_activation(self.gaussians_opacity_grad)
-            boosted_opacity = torch.clamp(opacity * 10.0, max=0.999)
-            
-            render_pkg = render(self.gaussians_xyz_grad, self.gaussians_features_dc_grad, self.gaussians_features_rest_grad,
-                                boosted_opacity, # 使用 Boost 后的透明度
-                                self.scaling_activation(self.gaussians_scaling_grad),
-                                self.rotation_activation(self.gaussians_rotation_grad),
-                                self.gaussians.get_active_sh_degree(), self.gaussians.get_max_sh_degree(),
-                                camera_center, world_view_transform, self.projection_matrix, 
-                                self.fovx, self.fovy, self.H, self.W)
-            
-            depth_render = render_pkg["depth"][0]
-            
-            # ==============================================================================
-            # 深度边缘检测 (Edge Protection)
-            # ==============================================================================
-            g_depth = gt_depth
-            dy = torch.abs(g_depth[1:, :] - g_depth[:-1, :])
-            dx = torch.abs(g_depth[:, 1:] - g_depth[:, :-1])
-            dy = torch.nn.functional.pad(dy, (0, 0, 0, 1))
-            dx = torch.nn.functional.pad(dx, (0, 1, 0, 0))
-            edge_mask = (dy > 0.1) | (dx > 0.1)
-
-            # ==============================================================================
-            # 2. 判定逻辑
-            # ==============================================================================
-            depth_diff = gt_depth - depth_render
-            
-            # 物理遮挡: 渲染比真值近 5cm
-            is_blocking = (depth_diff > 0.05) & (gt_depth > 0)
-            
-            # 鬼影判定: 物理挡路 & 语义背景 & 非边缘
-            pixel_guilty_mask = is_blocking & seg_mask & (gt_depth > 0) & (~edge_mask)
-            
-            # 洗白判定
-            pixel_innocent_mask = (torch.abs(depth_diff) < 0.02) & (gt_depth > 0)
-
-            if pixel_guilty_mask.sum() == 0:
-                return
-
-            # 3. 筛选嫌疑点
-            if self.gaussians_creation_frame_id is None: return
-            creation_ids = self.gaussians_creation_frame_id.squeeze()
-            ghost_counts = self.gaussians_ghost_count.squeeze()
-            
-            suspect_xyz = self.gaussians_xyz_grad
-
-            # 4. 投影关联
-            w2c = torch.inverse(cur_c2w)
-            R = w2c[:3, :3]; T = w2c[:3, 3]
-            pts_cam = (suspect_xyz @ R.T) + T
-            x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
-            
-            u = (x/z * self.fx + self.cx).long()
-            v = (y/z * self.fy + self.cy).long()
-            valid_uv = (z > 0.01) & (u >= 0) & (u < self.W) & (v >= 0) & (v < self.H)
-            
-            if valid_uv.any():
-                valid_indices_global = torch.where(valid_uv)[0]
-                u_valid, v_valid = u[valid_uv], v[valid_uv]
-                z_valid = z[valid_uv]
-                
-                # Z-Check
-                depth_at_pixel = depth_render[v_valid, u_valid]
-                is_contributor = (z_valid <= (depth_at_pixel + 0.05))
-                
-                is_pixel_guilty = pixel_guilty_mask[v_valid, u_valid]
-                is_pixel_innocent = pixel_innocent_mask[v_valid, u_valid]
-                
-
-                # =================== Step 5: 更新计数 (修正版) ===================
-                
-                # 1. 定义全图的重罪 mask (这是 HxW 的图)
-                is_heavy_crime_map = (depth_diff > 0.20)
-                
-                # [关键修正]：必须从图中取出对应像素点的值，使其变成 (N,) 的向量
-                # 这样它才能和 is_pixel_guilty (N,) 进行运算
-                is_heavy_crime = is_heavy_crime_map[v_valid, u_valid]
-                
-                # 2. 重罪点 (Heavy Guilty)
-                mask_heavy = is_pixel_guilty & is_heavy_crime
-                heavy_points = is_contributor & mask_heavy
-                idx_heavy = valid_indices_global[heavy_points]
-                
-                if len(idx_heavy) > 0:
-                    ghost_counts[idx_heavy] += 10 # 严厉惩罚
-                
-                # 3. 轻罪点 (Light Guilty)
-                # 同样，这里的运算现在都是 (N,) 对 (N,) 了，是合法的
-                mask_light = is_pixel_guilty & (~is_heavy_crime)
-                light_points = is_contributor & mask_light
-                idx_light = valid_indices_global[light_points]
-                
-                if len(idx_light) > 0:
-                    ghost_counts[idx_light] += 1 # 标准惩罚
-
-                # 4. 奖励逻辑 (保持不变)
-                innocent_points = is_contributor & is_pixel_innocent
-                idx_to_reward = valid_indices_global[innocent_points]
-                if len(idx_to_reward) > 0:
-                    ghost_counts[idx_to_reward] = torch.clamp(ghost_counts[idx_to_reward] - 1, min=0)
-
-                # 6. 分级处决 (Hierarchical Execution)
-                point_ages = current_frame_idx - creation_ids
-                prune_thresholds = torch.ones_like(ghost_counts) * 3 
-                prune_thresholds[point_ages > 3] = 10
-                prune_thresholds[point_ages > 10] = 50
-                
-                death_mask = (ghost_counts > prune_thresholds)
-                
-                # Debug Visualization
-                if death_mask.sum() > 0:
-                    try:
-                        prune_xyz = self.gaussians_xyz_grad[death_mask]
-                        pts_cam_p = (prune_xyz @ R.T) + T
-                        x_p, y_p, z_p = pts_cam_p[:, 0], pts_cam_p[:, 1], pts_cam_p[:, 2]
-                        valid_z_p = z_p > 0.01
-                        
-                        u_p = (x_p[valid_z_p] / z_p[valid_z_p] * self.fx + self.cx).long()
-                        v_p = (y_p[valid_z_p] / z_p[valid_z_p] * self.fy + self.cy).long()
-                        
-                        valid_draw = (u_p >= 0) & (u_p < self.W) & (v_p >= 0) & (v_p < self.H)
-                        u_draw = u_p[valid_draw].cpu().numpy()
-                        v_draw = v_p[valid_draw].cpu().numpy()
-                        
-                        viz_img = (gt_color.cpu().numpy() * 255).astype(np.uint8).copy()
-                        viz_img = cv2.cvtColor(viz_img, cv2.COLOR_RGB2BGR)
-                        viz_img[v_draw, u_draw] = [0, 0, 255] 
-                        
-                        save_name = f"{current_frame_idx:05d}_pruned_{death_mask.sum().item()}.png"
-                        save_path = os.path.join(self.debug_prune_dir, save_name)
-                        cv2.imwrite(save_path, viz_img)
-                    except Exception:
-                        pass
-
-                if death_mask.sum() > 0:
-                    self.prune_points(death_mask)
     
 
     def optimize_map(self, num_joint_iters, idx, cur_gt_color, cur_gt_depth, gt_cur_c2w,
@@ -1338,8 +1051,7 @@ class gs_tracking_mapping():
                 {'params': mlp_exposure_para_list, 'lr': 0.005, "name": "mlp_expos_para"})
 
         self.optimizer = torch.optim.Adam(optim_para_list)
-        if idx > 0 and not color_refine:
-            num_joint_iters = 300
+
 
         total_gs_point_num = self.gaussians.get_xyz().shape[0]
         print('total gaussian points number: ', f'{total_gs_point_num}')
@@ -1466,47 +1178,65 @@ class gs_tracking_mapping():
             weighted_color_loss = self.w_color_loss*color_loss*(1-self.lambda_ssim_loss)
             loss += weighted_color_loss
 
-            # -------------------- [替换/升级] 几何形态引导 (Morphology Loss) --------------------
-            # 获取当前的高斯属性
-            current_scales = self.scaling_activation(self.gaussians_scaling_grad)    # [N, 3]
-            current_opacities = self.opacity_activation(self.gaussians_opacity_grad) # [N, 1]
-            # 1. 轴长排序：找到每个高斯球的 最短轴(厚度) 和 最长轴(半径)
-            # torch.sort 返回 (values, indices)，我们只需要 values
+            # =================================================================================
+            # 1. 核心 Loss：安全版 2D 扁平圆盘正则 (Safe Anti-Needle Disk Loss)
+            # =================================================================================
+            current_scales = self.scaling_activation(self.gaussians_scaling_grad)    
+            current_opacities = self.opacity_activation(self.gaussians_opacity_grad) 
+            
+            # 排序：提取 厚度(min), 短半径(mid), 长半径(max)
             sorted_scales, _ = torch.sort(current_scales, dim=1)
-            min_scales = sorted_scales[:, 0] # 最短轴 (对于墙面就是厚度)
-            max_scales = sorted_scales[:, 2] # 最长轴 (对于墙面就是延展范围)
+            min_scales = sorted_scales[:, 0] 
+            mid_scales = sorted_scales[:, 1] 
+            max_scales = sorted_scales[:, 2] 
             
-            # 2. 扁平化损失 (Anisotropy Loss) -> 解决"糊"的关键
-            # 逻辑：对于实心的表面点(Opacity高)，我们希望它 极薄(min小) 且 广阔(max大)。
-            # 即希望 ratio = min / max 趋近于 0。
-            # 加上 1e-4 防止除以零异常
-            flatness_ratio = min_scales / (max_scales + 1e-4)
+            # 安全扁平化：允许变扁，保留 0.05 (1:20) 厚度兜底防止 NaN
+            flatness_ratio = torch.relu((min_scales / (max_scales + 1e-4)) - 0.05)
+            # 抗针状约束：强迫两长轴相等，变成“硬币”消灭视角伪影
+            needle_ratio = torch.abs(max_scales - mid_scales) / (max_scales + 1e-4)
             
-            # 这里的 .squeeze() 很关键，确保维度匹配
-            # 权重 current_opacities 的作用：只要求"看得见"的点变扁，
-            # 对于刚生成的透明小点(还在生长中)，稍微宽容一点，不要过早压扁。
-            loss_aniso = (flatness_ratio * current_opacities.squeeze()).mean()
+            # 仅对已经成型的点（Opacity > 0.3）施加形状约束
+            mask_mature_shape = current_opacities.squeeze() > 0.3
             
-            # 权重建议：0.5 ~ 1.0。这个力必须大，才能把球压成纸。
-            loss += 0.5 * loss_aniso
+            if mask_mature_shape.sum() > 0:
+                loss_flat = (flatness_ratio[mask_mature_shape] * current_opacities[mask_mature_shape].squeeze()).mean()
+                loss_needle = (needle_ratio[mask_mature_shape] * current_opacities[mask_mature_shape].squeeze()).mean()
+                loss += 0.5 * loss_flat + 0.5 * loss_needle
 
-            # 3. 鬼影抑制 (Floater Loss) -> 解决"伪影"的防线
-            # 逻辑：保留之前的逻辑。虽然允许 max_scales 变大，但仅限于实心点。
-            # 如果一个点 既大(max_scales大) 又 虚(Opacity低)，那它依然是作弊的 Floater，必须罚。
-            # 注意：这里权重保持 0.01 即可，不要太大，否则会和上面的"允许变大"冲突。
-            loss_floater = torch.mean((max_scales * (1.0 - current_opacities.squeeze())) ** 2)
-            loss += 0.01 * loss_floater
-            # ---------------------------------------------------------------------------------
-
+            # 反向传播计算梯度
             loss.backward(retain_graph=False)
 
-
-
             self.max_radii2D = radii
-            with torch.no_grad():
-                if joint_iter > 0 and joint_iter % 20 == 0:
-                    self.prune_neural_point(0.001)
 
+            with torch.no_grad():
+                # =================================================================================
+                # 2. 老点保护：基于生成帧 ID 的几何梯度冻结 (Age-based Geometry Freezing)
+                # =================================================================================
+                # 计算每个点存活的帧数 (年龄)
+                age = idx.item() - self.gaussians_creation_frame_id.squeeze()
+                
+                # 存活超过 5 帧的点被视为“成熟老点”
+                mask_mature_freeze = age > 5
+                
+                if mask_mature_freeze.sum() > 0:
+                    # 强行把老点的空间和形态梯度缩小到 1%（相当于锁死几何）
+                    # 防止因为位姿微小漂移导致老墙面被反复拉扯变糊
+                    self.gaussians_xyz_grad.grad[mask_mature_freeze] *= 0.01
+                    self.gaussians_scaling_grad.grad[mask_mature_freeze] *= 0.01
+                    self.gaussians_rotation_grad.grad[mask_mature_freeze] *= 0.01
+                    # 注意：保留了颜色(SH)和透明度(Opacity)的梯度，允许适应光照和被剪枝
+
+                # =================================================================================
+                # 3. 延后清理机制 (仅在 optimize_map 中保留此段，optimize_cur_map 中不要这段！)
+                # =================================================================================
+                # 只在进度达到 80% 及最后一次迭代时，执行清理，给新点充足的容错与下降时间
+                # 如果你是在修改 optimize_cur_map，请把下面这个 if 判断删掉！
+                prune_step_1 = int(num_joint_iters * 0.8)
+                prune_step_2 = num_joint_iters - 1
+                if joint_iter in [prune_step_1, prune_step_2]:
+                    self.prune_neural_point(0.01) 
+
+                # 优化器步进
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 actual_joint_iters += 1
@@ -1836,16 +1566,21 @@ class gs_tracking_mapping():
             num_joint_iters = self.iters_first
 
         cur_c2w = self.estimate_c2w_list[idx].to(self.device)
+
         for outer_joint_iter in range(outer_joint_iters):
             self.BA = (len(self.keyframe_list) >
                         4) and self.cfg['mapping']['BA']
-            self.optimize_cur_map(num_joint_iters, idx, gt_color, gt_depth, gt_c2w, cur_c2w, color_refine=color_refine, seg_mask = seg_mask)
-            _ = self.optimize_map(num_joint_iters, idx, gt_color, gt_depth, gt_c2w,
+            
+            # 【修改点 A】：用 dynamic_iters 接收前线返回的实际迭代次数
+            dynamic_iters = self.optimize_cur_map(num_joint_iters, idx, gt_color, gt_depth, gt_c2w, cur_c2w, color_refine=color_refine, seg_mask = seg_mask)
+            
+            # 【修改点 B】：把 dynamic_iters 喂给 optimize_map (替换原来的 num_joint_iters)
+            _ = self.optimize_map(dynamic_iters, idx, gt_color, gt_depth, gt_c2w,
                                     self.keyframe_dict, self.keyframe_list, cur_c2w, color_refine=color_refine, cur_seg_mask = seg_mask)
+            
             if self.BA:
                 cur_c2w = _
-                self.estimate_c2w_list[idx] = cur_c2w
-                
+                self.estimate_c2w_list[idx] = cur_c2w      
 
         if (idx % self.keyframe_every == 0 or idx == self.n_img - 2) and \
            (idx not in self.keyframe_list) and \
