@@ -215,7 +215,11 @@ class GaussianModel():
             dist4, _ = self.find_closed_faiss(pts)
             dist4 = dist4[:, 1:].mean(dim=1)
             dist4 = torch.clamp_min(dist4.float().cuda(), 0.0000001)
-            scales = torch.log(torch.sqrt(dist4))[..., None].repeat(1, 3)
+            # [修改] 引入 1.6 倍的过度膨胀 (Over-dilation)
+            # 1.6 是一个经验值：保证新点能覆盖住周围的空隙，并与邻居产生平滑的 Alpha 混合
+            # 如果觉得还不够平滑，可以加到 2.0，但不建议超过 3.0 (会像云)
+            scales = torch.log(torch.sqrt(dist4) * 1.6)[..., None].repeat(1, 3)
+            #scales = torch.log(torch.sqrt(dist4))[..., None].repeat(1, 3)
 
             rots = torch.zeros((pts.shape[0], 4), device="cuda")
             rots[:, 0] = 1
