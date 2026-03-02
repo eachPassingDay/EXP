@@ -415,7 +415,7 @@ class gs_tracking_mapping():
             # 使用恒定数量，保证均匀分布，细节留给 Module 1 去补
             add_pts_num = self.pixels_adding * 6
         else:
-            add_pts_num = 1000      
+            add_pts_num = 2000      
 
         # 随机采样 (Random Sampling)
         batch_rays_o, batch_rays_d, batch_gt_depth, batch_gt_color, i, j = get_samples(
@@ -474,132 +474,132 @@ class gs_tracking_mapping():
 
         # ================= [Module 1 Refined]: 联合密度与梯度采样 (含可视化) =================
         # [逻辑]：只在渲染密度不足(Density low) 且 (有纹理 OR 有几何边缘 OR 有空洞) 的地方加点
-        with torch.no_grad():
-            # --- 1. 准备数据 ---
-            depth_np = cur_gt_depth.cpu().numpy()
-            mask_static = refined_mask if refined_mask is not None else torch.ones_like(cur_gt_depth, dtype=torch.bool)          
+        # with torch.no_grad():
+        #     # --- 1. 准备数据 ---
+        #     depth_np = cur_gt_depth.cpu().numpy()
+        #     mask_static = refined_mask if refined_mask is not None else torch.ones_like(cur_gt_depth, dtype=torch.bool)          
 
-            # [计算纹理梯度]
-            gray = 0.299 * cur_gt_color[:,:,0] + 0.587 * cur_gt_color[:,:,1] + 0.114 * cur_gt_color[:,:,2]
-            grad_y, grad_x = torch.gradient(gray)
-            grad_mag = torch.sqrt(grad_x**2 + grad_y**2)
+        #     # [计算纹理梯度]
+        #     gray = 0.299 * cur_gt_color[:,:,0] + 0.587 * cur_gt_color[:,:,1] + 0.114 * cur_gt_color[:,:,2]
+        #     grad_y, grad_x = torch.gradient(gray)
+        #     grad_mag = torch.sqrt(grad_x**2 + grad_y**2)
             
-            # [计算深度边缘] (新增：防止边缘处空缺)
-            d_grad_y, d_grad_x = torch.gradient(cur_gt_depth)
-            d_grad_mag = torch.sqrt(d_grad_x**2 + d_grad_y**2)
+        #     # [计算深度边缘] (新增：防止边缘处空缺)
+        #     d_grad_y, d_grad_x = torch.gradient(cur_gt_depth)
+        #     d_grad_mag = torch.sqrt(d_grad_x**2 + d_grad_y**2)
 
-            is_close = cur_gt_depth < 2.5
-            is_far = ~is_close
+        #     is_close = cur_gt_depth < 2.5
+        #     is_far = ~is_close
 
-            # 动态梯度阈值
-            thresh_edge = torch.zeros_like(cur_gt_depth)
-            thresh_edge[is_close] = 0.05
-            thresh_edge[is_far] = 0.01  
+        #     # 动态梯度阈值
+        #     thresh_edge = torch.zeros_like(cur_gt_depth)
+        #     thresh_edge[is_close] = 0.05
+        #     thresh_edge[is_far] = 0.01  
             
-            cond_geo_grad = d_grad_mag > thresh_edge
+        #     cond_geo_grad = d_grad_mag > thresh_edge
 
-            # --- 2. 渲染 (获取 opacity_map) ---
-            # 依然是渲染，但我们不需要再手动算 density_map 了
-            render_pkg = render(
-                self.gaussians.get_xyz(), 
-                self.gaussians.get_features_dc(), 
-                self.gaussians.get_features_rest(),
-                self.opacity_activation(self.gaussians.get_opacity()), 
-                self.scaling_activation(self.gaussians.get_scaling()), 
-                self.rotation_activation(self.gaussians.get_rotation()),
-                self.gaussians.get_active_sh_degree(), 
-                self.gaussians.get_max_sh_degree(),
-                cur_c2w[:3, 3], 
-                torch.inverse(cur_c2w).transpose(0, 1), 
-                self.projection_matrix, 
-                self.fovx, self.fovy, self.H, self.W
-            )
+        #     # --- 2. 渲染 (获取 opacity_map) ---
+        #     # 依然是渲染，但我们不需要再手动算 density_map 了
+        #     render_pkg = render(
+        #         self.gaussians.get_xyz(), 
+        #         self.gaussians.get_features_dc(), 
+        #         self.gaussians.get_features_rest(),
+        #         self.opacity_activation(self.gaussians.get_opacity()), 
+        #         self.scaling_activation(self.gaussians.get_scaling()), 
+        #         self.rotation_activation(self.gaussians.get_rotation()),
+        #         self.gaussians.get_active_sh_degree(), 
+        #         self.gaussians.get_max_sh_degree(),
+        #         cur_c2w[:3, 3], 
+        #         torch.inverse(cur_c2w).transpose(0, 1), 
+        #         self.projection_matrix, 
+        #         self.fovx, self.fovy, self.H, self.W
+        #     )
             
-            # [核心升级]：直接使用渲染器输出的累积不透明度 (Alpha Map)
-            # Opacity map shape: [H, W], range [0, 1]
-            opacity_map = render_pkg["acc"][0] 
+        #     # [核心升级]：直接使用渲染器输出的累积不透明度 (Alpha Map)
+        #     # Opacity map shape: [H, W], range [0, 1]
+        #     opacity_map = render_pkg["acc"][0] 
 
-            # --- 3. 核心决策逻辑 (优化版) ---
+        #     # --- 3. 核心决策逻辑 (优化版) ---
             
-            # 基础安全区 (保持不变)
-            base_condition = mask_static & (cur_gt_depth > 0.01)
+        #     # 基础安全区 (保持不变)
+        #     base_condition = mask_static & (cur_gt_depth > 0.01)
             
-            # [策略修正 1]: 雪中送炭 (Hole Filling)
-            # 真正的空洞 (Opacity < 0.1) 必须补。
-            # 但为了防止和剪枝逻辑死锁，建议稍微放宽到 < 0.3，保证能填上深坑
-            cond_hole = (opacity_map < 0.3)
+        #     # [策略修正 1]: 雪中送炭 (Hole Filling)
+        #     # 真正的空洞 (Opacity < 0.1) 必须补。
+        #     # 但为了防止和剪枝逻辑死锁，建议稍微放宽到 < 0.3，保证能填上深坑
+        #     cond_hole = (opacity_map < 0.3)
 
-            cond_geo_edge = cond_geo_grad  & (opacity_map < 0.8)
+        #     cond_geo_edge = cond_geo_grad  & (opacity_map < 0.8)
 
-            # 情况 B: 纹理细节 (Texture Detail) -> 必须克制！
-            # 1. 提高梯度阈值 (0.02 -> 0.08)：忽略相机底噪，只关注真正的纹理线条
-            # 2. 降低不透明度上限 (0.95 -> 0.6)：
-            #    如果表面已经有 0.6 的不透明度，说明这里已经有高斯球了。
-            #    剩下的细节应该靠已有高斯球的分裂 (Split) 来完成，而不是盲目插入新点！
-            #    插入新点会导致 z-fighting 和细碎噪点。
-            cond_texture = (grad_mag > 0.15) & (opacity_map < 0.85)
+        #     # 情况 B: 纹理细节 (Texture Detail) -> 必须克制！
+        #     # 1. 提高梯度阈值 (0.02 -> 0.08)：忽略相机底噪，只关注真正的纹理线条
+        #     # 2. 降低不透明度上限 (0.95 -> 0.6)：
+        #     #    如果表面已经有 0.6 的不透明度，说明这里已经有高斯球了。
+        #     #    剩下的细节应该靠已有高斯球的分裂 (Split) 来完成，而不是盲目插入新点！
+        #     #    插入新点会导致 z-fighting 和细碎噪点。
+        #     cond_texture = (grad_mag > 0.15) & (opacity_map < 0.85)
 
-            # 合并逻辑：只在 (空洞) 或 (没修好的边缘) 或 (没修好的纹理) 处加点
-            target_mask = base_condition & (cond_hole | cond_geo_edge | cond_texture)
+        #     # 合并逻辑：只在 (空洞) 或 (没修好的边缘) 或 (没修好的纹理) 处加点
+        #     target_mask = base_condition & (cond_hole | cond_geo_edge | cond_texture)
 
-            # --- 4. 可视化 (更新为显示 Opacity) ---
-            if idx % 1 == 0: 
-                debug_dir = os.path.join(self.output, 'debug_sampling_mask')
-                os.makedirs(debug_dir, exist_ok=True)
+        #     # --- 4. 可视化 (更新为显示 Opacity) ---
+        #     if idx % 1 == 0: 
+        #         debug_dir = os.path.join(self.output, 'debug_sampling_mask')
+        #         os.makedirs(debug_dir, exist_ok=True)
                 
-                vis_img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
-                # 绿色：最终加点位置
-                vis_img[:, :, 1] = (target_mask.cpu().numpy() * 255).astype(np.uint8)
-                # 蓝色：重建程度 (越亮越实) -> 这次你有蓝色看了！
-                # 如果蓝色很黑，说明重建不充分；如果蓝色很亮(白色)，说明重建好了
-                vis_img[:, :, 0] = (opacity_map.cpu().numpy() * 255).astype(np.uint8)
+        #         vis_img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+        #         # 绿色：最终加点位置
+        #         vis_img[:, :, 1] = (target_mask.cpu().numpy() * 255).astype(np.uint8)
+        #         # 蓝色：重建程度 (越亮越实) -> 这次你有蓝色看了！
+        #         # 如果蓝色很黑，说明重建不充分；如果蓝色很亮(白色)，说明重建好了
+        #         vis_img[:, :, 0] = (opacity_map.cpu().numpy() * 255).astype(np.uint8)
                 
-                cv2.imwrite(os.path.join(debug_dir, f'mask_{idx:05d}.png'), vis_img)
+        #         cv2.imwrite(os.path.join(debug_dir, f'mask_{idx:05d}.png'), vis_img)
             
 
-            # --- 5. 执行加点 ---
-            num_fill = target_mask.sum().item()
+        #     # --- 5. 执行加点 ---
+        #     num_fill = target_mask.sum().item()
 
-            # ================= [新增诊断代码] =================
-            # 统计一下三个条件各贡献了多少点
-            # 注意：因为有 base_condition，我们需要与其做 AND 运算才能反映真实情况
-            count_hole = (base_condition & cond_hole).sum().item()
-            count_texture = (base_condition & cond_texture).sum().item()
-            count_edge = (base_condition & cond_geo_edge).sum().item()
+        #     # ================= [新增诊断代码] =================
+        #     # 统计一下三个条件各贡献了多少点
+        #     # 注意：因为有 base_condition，我们需要与其做 AND 运算才能反映真实情况
+        #     count_hole = (base_condition & cond_hole).sum().item()
+        #     count_texture = (base_condition & cond_texture).sum().item()
+        #     count_edge = (base_condition & cond_geo_edge).sum().item()
             
-            if num_fill > 0:
-                print(f"[Module 1 Diag] Total: {num_fill} | Hole: {count_hole}, Texture: {count_texture}, Edge: {count_edge}")
+        #     if num_fill > 0:
+        #         print(f"[Module 1 Diag] Total: {num_fill} | Hole: {count_hole}, Texture: {count_texture}, Edge: {count_edge}")
             
-            if num_fill > 0:
-                fill_budget = 6000 # 预算可以给足，因为Mask已经过滤得很好了
-                candidates = torch.nonzero(target_mask)
+        #     if num_fill > 0:
+        #         fill_budget = 6000 # 预算可以给足，因为Mask已经过滤得很好了
+        #         candidates = torch.nonzero(target_mask)
                 
-                if candidates.shape[0] > fill_budget:
-                    # 简单的随机采样
-                    indices = torch.randperm(candidates.shape[0])[:fill_budget]
-                    selected_coords = candidates[indices]
-                else:
-                    selected_coords = candidates
+        #         if candidates.shape[0] > fill_budget:
+        #             # 简单的随机采样
+        #             indices = torch.randperm(candidates.shape[0])[:fill_budget]
+        #             selected_coords = candidates[indices]
+        #         else:
+        #             selected_coords = candidates
                 
-                v_sel = selected_coords[:, 0]; u_sel = selected_coords[:, 1]
-                depth_new = cur_gt_depth[v_sel, u_sel]; color_new = cur_gt_color[v_sel, u_sel]
+        #         v_sel = selected_coords[:, 0]; u_sel = selected_coords[:, 1]
+        #         depth_new = cur_gt_depth[v_sel, u_sel]; color_new = cur_gt_color[v_sel, u_sel]
                 
-                x_new = (u_sel - cx) * depth_new / fx
-                y_new = (v_sel - cy) * depth_new / fy
-                z_new = depth_new
-                pts_c = torch.stack([x_new, y_new, z_new], dim=-1)
-                pts_w = (pts_c @ cur_c2w[:3, :3].T) + cur_c2w[:3, 3]
+        #         x_new = (u_sel - cx) * depth_new / fx
+        #         y_new = (v_sel - cy) * depth_new / fy
+        #         z_new = depth_new
+        #         pts_c = torch.stack([x_new, y_new, z_new], dim=-1)
+        #         pts_w = (pts_c @ cur_c2w[:3, :3].T) + cur_c2w[:3, 3]
                 
-                cam_center = cur_c2w[:3, 3]
-                rays_d = pts_w - cam_center
-                rays_d = rays_d / (torch.norm(rays_d, dim=-1, keepdim=True) + 1e-7)
-                rays_o = cam_center.expand_as(rays_d)
+        #         cam_center = cur_c2w[:3, 3]
+        #         rays_d = pts_w - cam_center
+        #         rays_d = rays_d / (torch.norm(rays_d, dim=-1, keepdim=True) + 1e-7)
+        #         rays_o = cam_center.expand_as(rays_d)
                 
-                _ = self.gaussians.add_neural_points(
-                    rays_o, rays_d, depth_new, color_new,
-                    current_frame_id = idx.item()
-                )
-                frame_pts_add += _
+        #         _ = self.gaussians.add_neural_points(
+        #             rays_o, rays_d, depth_new, color_new,
+        #             current_frame_id = idx.item()
+        #         )
+        #         frame_pts_add += _
            
         
         # ==========================================================
@@ -1234,7 +1234,7 @@ class gs_tracking_mapping():
                 prune_step_1 = int(num_joint_iters * 0.8)
                 prune_step_2 = num_joint_iters - 1
                 if joint_iter in [prune_step_1, prune_step_2]:
-                    self.prune_neural_point(0.01) 
+                    self.prune_neural_point(0.001) 
 
                 # 优化器步进
                 self.optimizer.step()
@@ -1411,12 +1411,13 @@ class gs_tracking_mapping():
             image = image.reshape(self.H, self.W, 3)
 
         nan_mask = (~torch.isnan(depth))
+        #因為更換了深度預測網絡提供的深度圖，所以原值8m限制去掉
         if self.ignore_outlier_depth_loss:
             depth_error = torch.abs(gt_depth-depth) * (gt_depth > 0)
             mask = (depth_error < 10*(depth_error[opacity_mask].median()))
-            mask = mask & (depth > 0) & (gt_depth > 0) & (gt_depth < 8.0)
+            mask = mask & (depth > 0) & (gt_depth > 0) # & (gt_depth < 8.0)
         else:
-            mask = (gt_depth > 0) & (gt_depth < 8.0)
+            mask = (gt_depth > 0) # & (gt_depth < 8.0)
 
         mask = mask & nan_mask
         mask = mask & edge_mask
@@ -1424,6 +1425,8 @@ class gs_tracking_mapping():
 
         if self.use_opacity_mask_for_loss:
             mask = mask & opacity_mask
+        #下面这句的变量名是你幻想出来的，如何纠正？
+        print(f"Valid Mask Px: {mask.sum().item()}")
 
         geo_loss = torch.clamp((torch.abs(gt_depth-depth)), min=0.0, max=1e3)[mask].sum()
         loss = self.w_geo_loss_tracking * geo_loss

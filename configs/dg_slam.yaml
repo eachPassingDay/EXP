@@ -33,7 +33,7 @@ mapping:
   geo_iter_ratio: 0.4  
   geo_iter_first: 400  
   every_frame: 5 # map only every X frames
-  BA: False # Do Bundle Adjustment or not
+  BA: True # Do Bundle Adjustment or not
   BA_cam_lr: 0.0002
   lazy_start: False # if to map every frame at beginning
   frustum_edge: -10 # enlarges image plane a little in frustum feature selection 
