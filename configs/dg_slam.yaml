@@ -43,7 +43,7 @@ mapping:
   save_ckpts: True # save output to .tar file
   keyframe_every: 10 # add frame to keyframe list every X frames
   mapping_window_size: 5 # X - 2 keyframes used for BA and mapping. 2X used for color refinement step (if used)
-  w_color_loss: 0.1 # weight of color loss term
+  w_color_loss: 0.1 # weight of color loss term  原 0.1
   w_geo_loss: 0.1
   lambda_ssim_loss: 0.2
   frustum_feature_selection: True # required for updating a local set of features from the neural point cloud

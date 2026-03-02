@@ -16,6 +16,7 @@ from dg_slam.config import load_config
 from dg_slam.gaussian.common import setup_seed
 from lietorch import SE3
 from evaluation.tartanair_evaluator import TartanAirEvaluator
+from dg_slam.gaussian.gaussian_render import render
 
 def parse_list(filepath, skiprows=0):
     """ read list data """
@@ -225,5 +226,127 @@ if __name__ == '__main__':
             traj_ref, traj_est, scale=True, title=scene + '_' + cfg["data"]["exp_name"], save_path = save_path)
         print(results)
         ate_list.append(results["ate_score"])
+
+        # ==========================================================
+        # 终极版：动态场景 Masked PSNR 评估 (全装甲防御版)
+        # ==========================================================
+        import numpy as np 
+        
+        print(f"开始对 {scene} 进行 Masked 渲染评估 (使用 OneFormer 遮罩)...")
+        
+        # 重新初始化 dataloader 以遍历序列
+        data_reader_eval = image_stream(scenedir, intrinsics_vec=intrinsics_vec)
+        
+        psnr_list = []
+        
+        # ==========================================================
+        # 终极版：动态场景 Masked PSNR 评估 (最简直接调用版)
+        # ==========================================================
+        import numpy as np 
+        
+        print(f"开始对 {scene} 进行 Masked 渲染评估 (使用 OneFormer 遮罩)...")
+        
+        # 重新初始化 dataloader
+        data_reader_eval = image_stream(scenedir, intrinsics_vec=intrinsics_vec)
+        psnr_list = []
+        
+        # 【精准定位】：直接指向 gs_tracking_mapping.py 中的实例！
+        mapper = dg_slam.tracking_mapping
+        eval_device = mapper.gaussians.get_xyz().device
+        
+        with torch.no_grad():
+            for frame_idx, (tstamp, gt_image, depth, intrinsics, gt_pose, seg_mask) in enumerate(tqdm(data_reader_eval)):
+                
+                # ------ 1. 位姿解析 (保留防御 TUM Numpy 数组崩溃的逻辑) ------
+                if frame_idx < len(traj_est):
+                    pose_data = traj_est[frame_idx]
+                    
+                    if isinstance(pose_data, np.ndarray):
+                        pose_data = torch.from_numpy(pose_data).float().to(eval_device)
+                    else:
+                        pose_data = pose_data.float().to(eval_device)
+                        
+                    if pose_data.dim() == 1 and pose_data.shape[0] >= 7:
+                        t = pose_data[1:4] if pose_data.shape[0] == 8 else pose_data[0:3]
+                        q = pose_data[4:8] if pose_data.shape[0] == 8 else pose_data[3:7]
+                            
+                        qx, qy, qz, qw = q[0], q[1], q[2], q[3]
+                        R = torch.zeros((3, 3), device=eval_device)
+                        R[0,0] = 1 - 2*qy**2 - 2*qz**2; R[0,1] = 2*qx*qy - 2*qz*qw; R[0,2] = 2*qx*qz + 2*qy*qw
+                        R[1,0] = 2*qx*qy + 2*qz*qw; R[1,1] = 1 - 2*qx**2 - 2*qz**2; R[1,2] = 2*qy*qz - 2*qx*qw
+                        R[2,0] = 2*qx*qz - 2*qy*qw; R[2,1] = 2*qy*qz + 2*qx*qw; R[2,2] = 1 - 2*qx**2 - 2*qy**2
+                        
+                        c2w_est = torch.eye(4, device=eval_device)
+                        c2w_est[:3, :3] = R
+                        c2w_est[:3, 3] = t
+                    else:
+                        c2w_est = pose_data.to(eval_device)
+                else:
+                    break 
+                
+                # ------ 2. 图像转换 ------
+                if isinstance(gt_image, np.ndarray):
+                    gt_image = torch.from_numpy(gt_image)
+                gt_img_tensor = gt_image.to(eval_device).float() / 255.0
+                if gt_img_tensor.dim() == 3:
+                    if gt_img_tensor.shape[-1] == 3: 
+                        gt_img_tensor = gt_img_tensor.permute(2, 0, 1).unsqueeze(0)
+                    elif gt_img_tensor.shape[0] == 3: 
+                        gt_img_tensor = gt_img_tensor.unsqueeze(0)
+                
+                # ------ 3. 掩码转换 ------
+                if isinstance(seg_mask, np.ndarray):
+                    seg_mask = torch.from_numpy(seg_mask)
+                static_mask = (seg_mask == 0).to(eval_device)
+                static_mask_4d = static_mask.unsqueeze(0).unsqueeze(0).expand(1, 3, -1, -1) 
+                
+                # ------ 4. 调用原装渲染器 ------
+                # 完全对应你在 gs_tracking_mapping.py 里的写法
+                render_pkg = render(
+                    mapper.gaussians.get_xyz(), 
+                    mapper.gaussians.get_features_dc(), 
+                    mapper.gaussians.get_features_rest(),
+                    mapper.opacity_activation(mapper.gaussians.get_opacity()), 
+                    mapper.scaling_activation(mapper.gaussians.get_scaling()), 
+                    mapper.rotation_activation(mapper.gaussians.get_rotation()),
+                    mapper.gaussians.get_active_sh_degree(), 
+                    mapper.gaussians.get_max_sh_degree(),
+                    c2w_est[:3, 3], 
+                    torch.inverse(c2w_est).transpose(0, 1), 
+                    mapper.projection_matrix, 
+                    mapper.fovx, mapper.fovy, mapper.H, mapper.W
+                )
+                render_img = render_pkg["render"].unsqueeze(0).clamp(0, 1) 
+                
+                # ------ 5. 计算 Masked PSNR ------
+                render_valid = render_img[static_mask_4d]
+                gt_valid = gt_img_tensor[static_mask_4d]
+                
+                if render_valid.numel() > 0:
+                    mse = torch.mean((render_valid - gt_valid) ** 2)
+                    frame_psnr = -10.0 * torch.log10(mse + 1e-10) 
+                    psnr_list.append(frame_psnr.item())
+
+
+        # 汇总当前场景指标
+        scene_avg_psnr = sum(psnr_list) / len(psnr_list) if psnr_list else 0
+        print(f"[{scene}] 平均 Masked PSNR: {scene_avg_psnr:.4f}")
+        
+        # ================= [新增：输出并保存每一帧的 PSNR] =================
+        # 1. 在终端格式化打印出来（保留 4 位小数，方便直接看）
+        #formatted_psnr_list = [round(p, 4) for p in psnr_list]
+        #print(f"[{scene}] 所有帧的 Masked PSNR 列表: \n{formatted_psnr_list}")
+        
+        # 2. 自动保存为 txt 文件，方便你后续直接写个 python 脚本画折线图
+        psnr_log_path = os.path.join(save_path, f"{scene}_psnr_per_frame.txt")
+        with open(psnr_log_path, "w") as f:
+            f.write(f"Average Masked PSNR: {scene_avg_psnr:.4f}\n")
+            f.write("Frame_Index\tMasked_PSNR\n")
+            for idx, p in enumerate(psnr_list):
+                f.write(f"{idx}\t{p:.4f}\n")
+                
+        print(f"已将每帧数据落盘保存至: {psnr_log_path}")
+        # ==========================================================
+        # ==========================================================
     
     print(ate_list)
